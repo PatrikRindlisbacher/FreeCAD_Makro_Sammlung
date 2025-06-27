@@ -1,0 +1,368 @@
+import FreeCAD, FreeCADGui as Gui
+from PySide2 import QtWidgets, QtCore
+from collections import namedtuple
+from math import pi, cos, sin
+
+# ------------------------------------------
+# TaskPanels, die übrig geblieben sind, einfach schließen (max. 3 Versuche)
+for i in range(3):
+    if Gui.Control.activeDialog() is not None:
+        Gui.Control.closeDialog()
+    else:
+        break
+
+# ------------------------------------------
+# CAM/Path-Imports für FreeCAD 1.0.1
+from CAM.Path.Op import Custom
+from CAM.Path.Op import Util as PathUtils
+
+# ------------------------------------------------------------
+# DIN‑Tabelle (Tiefe & Senkloch‑Ø & y) -------------------------------------------
+HelixDIN = namedtuple("HelixDIN", ["tief", "senk", "durch", "zyl"])
+DIN_WERTE = {
+    "M 3":  HelixDIN(1.7,  6.3, 3.4, 0.2),
+    "M 4":  HelixDIN(2.2,  8.4, 4.5, 0.3),
+    "M 5":  HelixDIN(2.5, 10.5, 5.5, 0.3),
+    "M 6":  HelixDIN(3.0, 12.6, 6.6, 0.4),
+    "M 8":  HelixDIN(4.0, 16.8, 9.0, 0.4),
+    "M 10": HelixDIN(5.0, 21.0,11.0, 0.5),
+    "M 12": HelixDIN(6.0, 24.0,14.0, 0.5),
+    "M 16": HelixDIN(8.0, 32.0,18.0, 0.5),
+    "M 18": HelixDIN(9.0, 36.0,20.0, 0.5),
+    # ... ergänze nach Bedarf ...
+}
+
+# ------------------------------------------------------------
+# G‑Code‑Generator: mit zylindrischem Teil oben & unten
+def generate_helix_gcode(center, r_top, r_bottom, z_top, z_bottom, pitch, feedrate, zyl_top=0.0, zyl_bottom=0.0):
+    """Erzeuge Helix‑G‑Code mit zylindrischem Teil oben und unten."""
+    total_height = z_top - z_bottom
+    z1 = z_top - zyl_top               # Ende oben zylindrisch
+    z2 = z_bottom + zyl_bottom         # Start unten zylindrisch
+    if z1 < z2: z1 = z2  # Schutz, falls y zu groß
+
+    # Teilung in drei Abschnitte
+    sections = []
+    if z_top > z1:    # Oben zylindrisch
+        sections.append((z_top, z1, r_top, r_top))
+    if z1 > z2:       # Konischer Mittelteil
+        sections.append((z1, z2, r_top, r_bottom))
+    if z2 > z_bottom: # Unten zylindrisch
+        sections.append((z2, z_bottom, r_bottom, r_bottom))
+
+    gc = [f"G0 X{center.x:.3f} Y{center.y:.3f} Z{z_top:.3f}"]
+
+    # Wie viele Helix-Umdrehungen?
+    helix_height = abs(z_top - z_bottom)
+    helix_turns = max(1, int(helix_height / pitch))
+    angle_total = 2 * pi * helix_turns
+
+    z_global0 = z_top
+    for z_start, z_end, r_start, r_end in sections:
+        dz = z_end - z_start
+        seg_height = abs(dz)
+        seg_turns = max(1, int(seg_height / pitch))
+        pts = max(2, seg_turns * 36)
+        for i in range(1, pts+1):
+            t = i / pts
+            z = z_start + t * dz
+            # Für kontinuierliche Winkelberechnung:
+            ratio = (z_global0 - z) / helix_height if helix_height != 0 else 0
+            angle = ratio * angle_total
+            r = r_start + t * (r_end - r_start)
+            x = center.x + cos(angle) * r
+            y = center.y + sin(angle) * r
+            gc.append(f"G1 X{x:.3f} Y{y:.3f} Z{z:.3f} F{feedrate}")
+    return gc
+
+# ------------------------------------------------------------
+# UI‑Panel -------------------------------------------------------------------
+class HelixPanel(QtWidgets.QWidget):
+    """TaskPanel‑UI für Helix‑Senkung."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Helix‑Senkung erstellen")
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.setFocus()
+
+        # ------ interne Werte ------
+        self.pt = None   # Mittelpunkt des Loches (Vector)
+        self.r_start = 0  # Radius des Bohrlochs
+        self.edit_obj = None  # vorhandenes CAM‑Objekt zum Re‑Editieren
+
+        # ------ Layout ------
+        form = QtWidgets.QFormLayout(self)
+
+        # 1. Auswahl
+        self.auto_depth = QtWidgets.QComboBox()
+        self.auto_depth.addItem("– manuell –")
+        self.auto_depth.addItems(DIN_WERTE.keys())
+        self.auto_depth.currentIndexChanged.connect(self.update_din_defaults)
+        form.addRow("DIN‑Senkung:", self.auto_depth)
+
+        # 2. Automatisch/Standard (inkl. zyl. Teil)
+        self.d_top        = self._spin(form, "Ø oben:")
+        self.d_bottom     = self._spin(form, "Ø unten:")
+        self.taper_depth  = self._spin(form, "Senkungstiefe:", 0.1, 20.0, suffix=" mm", default=2.8)
+        self.zyl_height   = self._spin(form, "Zyl. Teil (y):", 0.0, 5.0, suffix=" mm", default=0.3)
+
+        # 3. Geometrie
+        self.x_center     = self._spin(form, "X‑Zentrum:", -1000, 1000)
+        self.y_center     = self._spin(form, "Y‑Zentrum:", -1000, 1000)
+        self.z_start      = self._spin(form, "Z‑Start:",  -1000, 1000)
+        self.z_end        = self._spin(form, "Z‑Ende:",   -1000, 1000)
+
+        # 4. Werkzeug/Werkstück
+        self.d_tool       = self._spin(form, "Fräser‑Ø:", default=3.0)
+        self.feed         = self._spin(form, "Vorschub:", 1, 20000, suffix=" mm/min", default=150)
+        self.pitch        = self._spin(form, "Steigung:", 0.01, 10, suffix=" mm/U", default=0.5)
+
+        # Info & Button
+        self.info  = QtWidgets.QLabel("Kreis im Modell wählen …")
+        form.addRow(self.info)
+        self.btn_ok = QtWidgets.QPushButton()
+        self.btn_ok.clicked.connect(self.finish)
+        self.btn_ok.setEnabled(False)
+        form.addRow(self.btn_ok)
+
+        self.btn_close = QtWidgets.QPushButton("Panel schließen")
+        self.btn_close.clicked.connect(self.close_panel)
+        form.addRow(self.btn_close)
+
+        # Setze initial die richtige Beschriftung
+        self.set_button_text()
+
+        # Selection‑Observer
+        self.obs = self.Observer(self)
+        Gui.Selection.addObserver(self.obs)
+
+    def set_button_text(self):
+        if self.edit_obj:
+            self.btn_ok.setText(f"{self.edit_obj.Name} ändern")
+        else:
+            self.btn_ok.setText("Neu erstellen")
+
+    # ------ Helper ---------------------------------------------------------
+    def _spin(self, layout, label, minv=0.1, maxv=100.0, suffix=" mm", default=0.0):
+        sb = QtWidgets.QDoubleSpinBox()
+        sb.setRange(minv, maxv)
+        sb.setDecimals(3)
+        sb.setSuffix(suffix)
+        sb.setValue(default)
+        layout.addRow(label, sb)
+        return sb
+
+    # ------ DIN‑Aktualisierung ---------------------------------------------
+    def update_din_defaults(self):
+        """Setze Ø oben immer, Tiefe, Zyl. Höhe nur wenn Kreis gewählt."""
+        name = self.auto_depth.currentText()
+        if name not in DIN_WERTE:
+            return
+
+        entry = DIN_WERTE[name]
+        # Ø oben, unten, Senktiefe, zyl. Teil setzen
+        self.d_top.setValue(entry.senk)
+        self.d_bottom.setValue(entry.durch)
+        self.taper_depth.setValue(entry.tief)
+        self.zyl_height.setValue(entry.zyl)
+
+        # Z‑Ende nur, wenn Kreis bereits gewählt wurde
+        if self.pt:
+            self.z_end.setValue(self.pt.z - entry.tief)
+            self.btn_ok.setEnabled(True)
+
+    # ------ Selection‑Observer ---------------------------------------------
+    class Observer:
+        def __init__(self, panel):
+            self.panel = panel
+
+        def addSelection(self, doc, obj, sub, pos):
+            sel = Gui.Selection.getSelection()
+            # 1. CAM-Objekt mit DIN? (Edit-Modus)
+            if sel and hasattr(sel[0], "Proxy") and hasattr(sel[0], "DIN"):
+                self.panel.edit_obj = sel[0]
+                obj = sel[0]
+                self.panel.auto_depth.setCurrentText(obj.DIN)
+                self.panel.d_top.setValue(obj.DiameterTop.Value)
+                self.panel.d_bottom.setValue(obj.DiameterBottom.Value)
+                self.panel.taper_depth.setValue(obj.Senkungstiefe if hasattr(obj, "Senkungstiefe") else obj.ZStart.Value - obj.ZEnd.Value if obj.ZEnd.Value > 0 else 2.8)
+                self.panel.zyl_height.setValue(getattr(obj, "ZylHeight", 0.3))
+                self.panel.r_start = obj.DiameterBottom.Value / 2.0
+                self.panel.d_tool.setValue(obj.ToolDiameter.Value)
+                self.panel.feed.setValue(obj.Feed.Value)
+                self.panel.pitch.setValue(obj.Pitch.Value)
+                self.panel.z_start.setValue(obj.ZStart.Value)
+                self.panel.z_end.setValue(obj.ZEnd.Value)
+                self.panel.x_center.setValue(obj.Center.x)
+                self.panel.y_center.setValue(obj.Center.y)
+                self.panel.pt = obj.Center
+                self.panel.btn_ok.setEnabled(True)
+                self.panel.set_button_text()
+                self.panel.info.setText(f"{obj.Name} geladen")
+                return
+
+            # 2. Sonst: Geometrie eines Kreises/Subobjekt übernehmen
+            sel_ex = Gui.Selection.getSelectionEx()
+            if not sel_ex or not sel_ex[0].SubObjects:
+                return
+            so = sel_ex[0].SubObjects[0]
+            p = r = None
+            if hasattr(so, "Center") and hasattr(so, "Radius"):
+                p, r = so.Center, so.Radius
+            elif hasattr(so, "Curve") and hasattr(so.Curve, "Radius"):
+                p, r = so.Curve.Center, so.Curve.Radius
+            elif hasattr(so, "Surface") and hasattr(so.Surface, "Radius"):
+                p, r = so.Surface.Position, so.Surface.Radius
+
+            if p and r:
+                self.panel.pt = p
+                self.panel.r_start = r
+                self.panel.x_center.setValue(p.x)
+                self.panel.y_center.setValue(p.y)
+                self.panel.z_start.setValue(p.z)
+                self.panel.update_din_defaults()
+                self.panel.info.setText(f"Kreis – X={p.x:.2f} Y={p.y:.2f} R={r:.2f}")
+                self.panel.btn_ok.setEnabled(True)
+                self.panel.set_button_text()
+            else:
+                self.panel.info.setText("Keine Kreisgeometrie erkannt.")
+                self.panel.btn_ok.setEnabled(False)
+
+    # ------ Schließen-Button-Funktion -----
+    def close_panel(self):
+        Gui.Selection.removeObserver(self.obs)
+        Gui.Control.closeDialog()
+
+    # ------ CAM‑Operation ---------------------------------------------------
+    def finish(self):
+        if self.z_end.value() >= self.z_start.value():
+            QtWidgets.QMessageBox.warning(self, "Z‑Fehler", "Z‑Ende muss unterhalb von Z‑Start liegen.")
+            return
+        if self.pt is None and not self.edit_obj:
+            QtWidgets.QMessageBox.warning(self, "Auswahl fehlt", "Bitte einen Kreis wählen.")
+            return
+
+        center_vec = FreeCAD.Vector(self.x_center.value(), self.y_center.value(), self.z_start.value())
+        z_top = self.z_start.value()
+        z_bottom = self.z_end.value()
+        y_zyl = self.zyl_height.value()
+
+        gcode = generate_helix_gcode(
+            center   = center_vec,
+            r_top    = self.d_top.value() / 2.0,
+            r_bottom = self.d_bottom.value() / 2.0,
+            z_top    = z_top,
+            z_bottom = z_bottom,
+            pitch    = self.pitch.value(),
+            feedrate = self.feed.value(),
+            zyl_top  = y_zyl,
+            zyl_bottom = y_zyl,
+        )
+
+        doc = FreeCAD.ActiveDocument
+        # Neu anlegen oder bestehendes Objekt aktualisieren
+        if self.edit_obj:
+            op = self.edit_obj
+            print("✓ Helix‑Senkung aktualisiert.")
+        else:
+            op = doc.addObject("Path::FeaturePython", "HelixSenkung")
+            Custom.ObjectCustom(op, "Custom")
+            op.ViewObject.Proxy = 0
+            print("✓ Helix‑Senkung erstellt.")
+
+        # Parameter speichern / aktualisieren
+        if not hasattr(op, "DIN"):
+            op.addProperty("App::PropertyString", "DIN", "Helix", "DIN-Größe (z. B. M5)")
+        op.DIN = self.auto_depth.currentText()
+        if not hasattr(op, "DiameterTop"):
+            op.addProperty("App::PropertyLength", "DiameterTop", "Helix", "Senklochdurchmesser")
+        op.DiameterTop = self.d_top.value()
+        if not hasattr(op, "DiameterBottom"):
+            op.addProperty("App::PropertyLength", "DiameterBottom", "Helix", "Bohrlochdurchmesser")
+        op.DiameterBottom = self.d_bottom.value()
+        if not hasattr(op, "ToolDiameter"):
+            op.addProperty("App::PropertyLength", "ToolDiameter", "Helix", "Fräserdurchmesser")
+        op.ToolDiameter = self.d_tool.value()
+        if not hasattr(op, "Feed"):
+            op.addProperty("App::PropertyLength", "Feed", "Helix", "Vorschub")
+        op.Feed = self.feed.value()
+        if not hasattr(op, "Pitch"):
+            op.addProperty("App::PropertyLength", "Pitch", "Helix", "Steigung")
+        op.Pitch = self.pitch.value()
+        if not hasattr(op, "Center"):
+            op.addProperty("App::PropertyVector", "Center", "Helix", "Zentrum")
+        op.Center = center_vec
+        if not hasattr(op, "ZStart"):
+            op.addProperty("App::PropertyLength", "ZStart", "Helix", "Z‑Start")
+        op.ZStart = self.z_start.value()
+        if not hasattr(op, "ZEnd"):
+            op.addProperty("App::PropertyLength", "ZEnd", "Helix", "Z‑Ende")
+        op.ZEnd = self.z_end.value()
+        if not hasattr(op, "ZylHeight"):
+            op.addProperty("App::PropertyLength", "ZylHeight", "Helix", "zylindrischer Teil")
+        op.ZylHeight = self.zyl_height.value()
+        op.Gcode = gcode
+
+        # Job-Integration (modern): Operation zu erstem CAM-Job hinzufügen
+        jobs = [o for o in doc.Objects if hasattr(o, "Proxy") and hasattr(o.Proxy, "addOperation")]
+        if not self.edit_obj and jobs:
+            job = jobs[0]
+            job.Proxy.addOperation(op)
+            # ToolController zuweisen (optional)
+            tcs = getattr(job, "Tools", None)
+            if tcs and hasattr(tcs, "Group") and len(tcs.Group) > 0:
+                op.ToolController = tcs.Group[0]
+
+        doc.recompute()
+        # Panel BLEIBT OFFEN!
+
+# ------------------------------------------------------------
+# TaskPanel‑Wrapper ---------------------------------------------------------
+class HelixTaskPanel:
+    def __init__(self):
+        self.form = HelixPanel()
+
+    def getPanel(self):
+        return self.form
+
+    def getStandardButtons(self):
+        return int(QtWidgets.QDialogButtonBox.Cancel)
+
+    def reject(self):
+        Gui.Selection.removeObserver(self.form.obs)
+        return True
+
+# ------------------------------------------------------------
+# Dialog starten ------------------------------------------------------------
+def show_helix_dialog():
+    # KEINE extra Dialog-Prüfung mehr – wir haben schon alles geschlossen!
+
+    # Prüfen ob bereits selektiertes Objekt wieder geladen werden kann
+    sel = Gui.Selection.getSelection()
+    if sel and hasattr(sel[0], "Proxy") and hasattr(sel[0], "DIN"):
+        dlg = HelixTaskPanel()
+        obj = sel[0]
+        dlg.form.auto_depth.setCurrentText(obj.DIN)
+        dlg.form.d_top.setValue(obj.DiameterTop.Value)
+        dlg.form.d_bottom.setValue(obj.DiameterBottom.Value)
+        dlg.form.taper_depth.setValue(obj.Senkungstiefe if hasattr(obj, "Senkungstiefe") else obj.ZStart.Value - obj.ZEnd.Value if obj.ZEnd.Value > 0 else 2.8)
+        dlg.form.zyl_height.setValue(getattr(obj, "ZylHeight", 0.3))
+        dlg.form.r_start = obj.DiameterBottom.Value / 2.0
+        dlg.form.d_tool.setValue(obj.ToolDiameter.Value)
+        dlg.form.feed.setValue(obj.Feed.Value)
+        dlg.form.pitch.setValue(obj.Pitch.Value)
+        dlg.form.z_start.setValue(obj.ZStart.Value)
+        dlg.form.z_end.setValue(obj.ZEnd.Value)
+        dlg.form.x_center.setValue(obj.Center.x)
+        dlg.form.y_center.setValue(obj.Center.y)
+        dlg.form.edit_obj = obj
+        dlg.form.pt = obj.Center
+        dlg.form.btn_ok.setEnabled(True)
+        dlg.form.set_button_text()
+        Gui.Control.showDialog(dlg)
+    else:
+        Gui.Control.showDialog(HelixTaskPanel())
+
+show_helix_dialog()
