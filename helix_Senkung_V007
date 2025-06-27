@@ -75,26 +75,28 @@ class HelixPanel(QtWidgets.QWidget):
         # ------ Layout ------
         form = QtWidgets.QFormLayout(self)
 
-        # DIN‑Auswahl
+        # 1. Auswahl
         self.auto_depth = QtWidgets.QComboBox()
         self.auto_depth.addItem("– manuell –")
         self.auto_depth.addItems(DIN_WERTE.keys())
         self.auto_depth.currentIndexChanged.connect(self.update_din_defaults)
         form.addRow("DIN‑Senkung:", self.auto_depth)
 
-        # Geometrie
-        self.d_top     = self._spin(form, "Ø oben:")
-        self.d_bottom  = self._spin(form, "Ø unten:")
-        self.d_tool    = self._spin(form, "Fräser‑Ø:", default=3.0)
-        self.feed      = self._spin(form, "Vorschub:", 1, 20000, suffix=" mm/min", default=150)
-        self.pitch     = self._spin(form, "Steigung:", 0.01, 10, suffix=" mm/U", default=0.5)
+        # 2. Automatisch/Standard
+        self.d_top        = self._spin(form, "Ø oben:")
+        self.d_bottom     = self._spin(form, "Ø unten:")
+        self.taper_depth  = self._spin(form, "Senkungstiefe:", 0.1, 20.0, suffix=" mm", default=2.8)
 
-        # Zentrum & Z‑Werte
-        self.taper_depth = self._spin(form, "Senkungstiefe:", 0.1, 20.0, suffix=" mm", default=2.8)
-        self.x_center  = self._spin(form, "X‑Zentrum:", -1000, 1000)
-        self.y_center  = self._spin(form, "Y‑Zentrum:", -1000, 1000)
-        self.z_start   = self._spin(form, "Z‑Start:",  -1000, 1000)
-        self.z_end     = self._spin(form, "Z‑Ende:",   -1000, 1000)
+        # 3. Geometrie
+        self.x_center     = self._spin(form, "X‑Zentrum:", -1000, 1000)
+        self.y_center     = self._spin(form, "Y‑Zentrum:", -1000, 1000)
+        self.z_start      = self._spin(form, "Z‑Start:",  -1000, 1000)
+        self.z_end        = self._spin(form, "Z‑Ende:",   -1000, 1000)
+
+        # 4. Werkzeug/Werkstück
+        self.d_tool       = self._spin(form, "Fräser‑Ø:", default=3.0)
+        self.feed         = self._spin(form, "Vorschub:", 1, 20000, suffix=" mm/min", default=150)
+        self.pitch        = self._spin(form, "Steigung:", 0.01, 10, suffix=" mm/U", default=0.5)
 
         # Info & Button
         self.info  = QtWidgets.QLabel("Kreis im Modell wählen …")
@@ -224,8 +226,7 @@ class HelixPanel(QtWidgets.QWidget):
             z_taper_depth = self.z_start.value() - self.taper_depth.value(),
             center   = center_vec,
             r_top    = self.d_top.value() / 2.0,
-            # r_bottom = self.r_start,
-            r_bottom = self.d_bottom.value() / 2.0,
+            r_bottom = self.d_bottom.value() / 2.0,  # <-- FIXED! Ø unten wird benutzt
             z_top    = self.z_start.value(),
             z_bottom = self.z_end.value(),
             pitch    = self.pitch.value(),
