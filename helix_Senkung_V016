@@ -126,8 +126,8 @@ class HelixPanel(QtWidgets.QWidget):
         self.z_start      = self._spin(form, "Z‑Start:",  -1000, 1000)
         self.z_end        = self._spin(form, "Z‑Ende:",   -1000, 1000)
         self.d_tool       = self._spin(form, "Fräser‑Ø:", default=3.0)
-        self.feed         = self._spin(form, "Vorschub:", 1, 20000, suffix=" mm/min", default=150)
-        self.pitch        = self._spin(form, "Steigung:", 0.01, 10, suffix=" mm/U", default=0.5)
+        self.feed         = self._spin(form, "Vorschub:", 1, 20000, suffix=" mm/min", default=250)
+        self.pitch        = self._spin(form, "Steigung:", 0.01, 10, suffix=" mm/U", default=0.1)
 
         self.info  = QtWidgets.QLabel("Kreis im Modell wählen …")
         form.addRow(self.info)
